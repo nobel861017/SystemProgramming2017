@@ -1,0 +1,16 @@
+# commit 1
+[new_file]
+a.txt
+[modified]
+[copied]
+(MD5)
+a.txt 0cc175b9c0f1b6a831c399e269772661
+
+# commit 2
+[new_file]
+[modified]
+[copied]
+a.txt => _a.txt
+(MD5)
+_a.txt 0cc175b9c0f1b6a831c399e269772661
+a.txt 0cc175b9c0f1b6a831c399e269772661

@@ -1,0 +1,403 @@
+//boss6.c
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <linux/limits.h>
+#include <unistd.h>
+#include <openssl/md5.h>
+#include <limits.h>
+#include "boss.h"
+#define Content_Len 4000
+
+typedef unsigned long long ull;
+
+char best_md5[33],  best_mine[Content_Len];
+int best_treasure = 0,  best_mine_size = 0;
+
+typedef enum {
+  QUIT = 0x01,
+  FOUND_TREASURE = 0x02,
+  START_SERVER = 0x03,
+  CLIENT_CANNOT_FIND_TREASURE = 0x04,
+  MINE = 0x05,
+  STATUS = 0x06,
+} protocol_op;
+
+typedef struct My_Protocol{
+    char append_str[Content_Len];
+    int strlength;
+    int op;
+    int n_treasure;
+    char who_found_treasure[PATH_MAX];
+    char md5[33];
+    ull start, end;
+    MD5_CTX c;
+} Protocol;
+
+int load_config_file(struct server_config *config, char *path){
+    FILE *fp = fopen(path,"r");
+    int counter = 0;
+    char *buf1 = malloc(PATH_MAX), *buf2 = malloc(PATH_MAX), *buf3 = malloc(PATH_MAX);
+    config->pipes = malloc(sizeof(struct pipe_pair)*100);
+    memset(buf1,0,PATH_MAX);
+    memset(buf2,0,PATH_MAX);
+    memset(buf3,0,PATH_MAX);
+    fscanf(fp,"%s %s",buf1,buf2);
+
+    config->mine_file = malloc(PATH_MAX);
+    strcpy(config->mine_file, buf2);
+    while(fscanf(fp,"%s %s %s",buf1,buf2,buf3) != EOF){
+        config->pipes[counter].input_pipe = malloc(PATH_MAX);
+        config->pipes[counter].output_pipe = malloc(PATH_MAX);
+        strcpy(config->pipes[counter].input_pipe, buf3);
+        strcpy(config->pipes[counter].output_pipe, buf2);
+        counter++;
+    }
+    
+    config->num_miners = counter;
+    fclose(fp);
+    free(buf1), free(buf2), free(buf3);
+    return 0;
+}
+
+void md5_add(MD5_CTX *miner_ans, int i){
+    unsigned char str[1];
+    memset(str, 0, sizeof(str));
+    str[0] = (unsigned char)i;
+    MD5_Update(miner_ans, str, 1);
+    return;
+}
+
+void print_md5(MD5_CTX miner_ans){
+    unsigned char md5[17];
+    memset(md5, 0, sizeof(md5));
+    MD5_Final(md5,&miner_ans);
+    for(int i = 0; i < MD5_DIGEST_LENGTH; i++){
+        printf("%02x",md5[i]);
+    }
+    puts("");
+}
+
+Protocol Get_one_Protocol_from_client(int input_fd){
+    //fprintf(stderr, "In Get_one_Protocol_from_server function\n");
+    Protocol message;
+    memset(&message, 0, sizeof(message));
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    fd_set readset;
+    FD_ZERO(&readset);
+    FD_SET(input_fd, &readset);
+    select(FD_SETSIZE, &readset, NULL, NULL, NULL);
+    if(FD_ISSET(input_fd, &readset)){
+        read(input_fd, &message, sizeof(message));
+        fprintf(stderr, "finish read from %d\n", input_fd);
+    }
+    return message;
+}
+Protocol Get_multiple_Protocol_from_client(int input_fd, MD5_CTX miner_ans){
+    //fprintf(stderr, "In Get_multiple_Protocol_from_server function\n");
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 10;
+    fd_set readset;
+    Protocol message;
+    while(1){
+        memset(&message, 0, sizeof(message));
+        FD_ZERO(&readset);
+        FD_SET(input_fd, &readset);
+        if(!select(FD_SETSIZE, &readset, NULL, NULL, &timeout)) continue;
+        if(FD_ISSET(input_fd, &readset)){
+            //fprintf(stderr, "GmPfc read\n");
+            read(input_fd, &message, sizeof(message));
+            //fprintf(stderr, "finish read from %d\n", input_fd);
+            if(message.op == STATUS){
+                printf("I'm working on ");
+                print_md5(miner_ans);
+                continue;
+            }
+        }
+        return message;
+    }
+}
+
+void Tell_client_boss_start(struct fd_pair *client_fds, int n){
+    for(int i = 0; i < n; i++){
+        Protocol message;
+        memset(&message, 0, sizeof(message));
+        message.op = START_SERVER;
+        write(client_fds[i].output_fd, &message, sizeof(message));
+    }
+}
+
+int handle_command( char *cmd, struct server_config *config, char *path, struct fd_pair *client_fds, int mine_bin_fd, int flag){
+    /* TODO parse user commands here */
+    //fprintf(stderr, "In handle_command function\n");
+    if(!flag){
+        if (strcmp(cmd, "status") == 0){
+            /* TODO show status */
+            if(best_treasure == 0)
+                printf("best 0-treasure in 0 bytes\n");
+            else
+                printf("best %d-treasure %s in %d bytes\n", best_treasure, best_md5, best_mine_size);
+            Protocol message;
+            memset(&message, 0, sizeof(Protocol));
+            message.op = STATUS;
+            for(int i = 0; i < config->num_miners; i++)
+                write(client_fds[i].output_fd, &message, sizeof(message));
+            return 1;
+        }
+        else if (strcmp(cmd, "dump") == 0){
+            int len, tmp_len = 0;
+            pid_t pid;
+            pid = fork();
+            if(pid == 0){
+                char buf[4096];
+                mine_bin_fd = open(config->mine_file, O_RDONLY);
+                int dump_file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                while((len = read(mine_bin_fd,buf, sizeof(buf))) != 0 )
+                    write(dump_file, buf, len);
+                fprintf(stderr, "Finish dump\n");
+                close(mine_bin_fd);
+                close(dump_file);
+                /*FILE *fp = fopen(config->mine_file, "rb");
+                FILE *fp2 = fopen(path, "wb");
+                while((len = fread(buf, 1, sizeof(buf), fp)) != 0 ){
+                    tmp_len+=len;
+                    fwrite(buf, 1, len, fp2);
+                }
+                fprintf(stderr, "Finish dump %d\n",tmp_len);
+                fclose(fp);
+                fclose(fp2);*/
+                return 0;
+            }
+            return 2;
+        }
+        else if(strcmp(cmd, "quit") == 0){
+            /* TODO tell clients to cease their jobs and exit normally */
+            Protocol quit;
+            memset(&quit, 0, sizeof(quit));
+            quit.op = QUIT;
+            for(int i = 0; i < config->num_miners; i++)
+                write(client_fds[i].output_fd, &quit, sizeof(quit));
+            return 0;
+        }
+    }
+    else if(flag == 1){
+        if (strcmp(cmd, "status") == 0){
+            printf("best 0-treasure in 0 bytes\n");
+            return 1;
+        }
+        else if (strcmp(cmd, "dump") == 0){
+            pid_t pid;
+            pid = fork();
+            if(pid == 0){
+                char buf[1];
+                FILE *fp2 = fopen(path, "wb");
+                fwrite(buf,0,0,fp2);
+                fprintf(stderr, "Finish dump\n");
+                fclose(fp2);
+                return 0;
+            }
+            return 2;
+        }
+        else if(strcmp(cmd, "quit") == 0){
+            Protocol quit;
+            memset(&quit, 0, sizeof(quit));
+            quit.op = QUIT;
+            for(int i = 0; i < config->num_miners; i++)
+                write(client_fds[i].output_fd, &quit, sizeof(quit));
+            return 0;
+        }
+    }
+}
+
+void assign_jobs(struct fd_pair *client_fds, int num_of_clients, int n_treasure, MD5_CTX *c){
+    int range, pre = -1;
+    range = 256/num_of_clients;
+    for(int i = 0; i < num_of_clients; i++){
+        Protocol assign;
+        memset(&assign, 0, sizeof(assign));
+        assign.n_treasure = n_treasure;
+        assign.op = MINE;
+        assign.c = *c;
+        assign.start = pre + 1;
+        assign.end = (i != (num_of_clients-1) ? pre + range : 255);
+        pre = assign.end;
+        write(client_fds[i].output_fd, &assign, sizeof(assign));
+        //fprintf(stderr, "assign to %d\n", client_fds[i].output_fd);
+    }
+    return;
+}
+
+int Check_Prefix_Zeros(MD5_CTX miner_ans){
+    unsigned char md5[MD5_DIGEST_LENGTH], md5_str[34];
+    memset(md5, 0, sizeof(md5));
+    memset(md5_str, 0, sizeof(md5_str));
+    MD5_CTX tmp = miner_ans;
+    MD5_Final(md5, &tmp);
+    int count = 0;
+    for(int i = 0; i < MD5_DIGEST_LENGTH; i++)
+        sprintf(md5_str+(i*2),(i != (MD5_DIGEST_LENGTH - 1)) ? "%02x":"%02x\0",md5[i]);
+    for(int i = 0; i < 32; i++){
+        if(md5_str[i] == '0') count++;
+        else break;
+    }
+    return count;
+}
+
+int main(int argc, char **argv){
+    memset(best_md5, 0, sizeof(best_md5));
+    memset(best_mine, 0, sizeof(best_mine));
+    /* sanity check on arguments */
+    if (argc != 2){
+        fprintf(stderr, "Usage: %s CONFIG_FILE\n", argv[0]);
+        exit(1);
+    }
+
+    /* load config file */
+    struct server_config config;
+    load_config_file(&config, argv[1]);
+    /* open the named pipes */
+    struct fd_pair client_fds[config.num_miners];
+    memset(client_fds, 0, sizeof(client_fds));
+    for (int ind = 0; ind < config.num_miners; ind += 1){
+        struct fd_pair *fd_ptr = &client_fds[ind];
+        struct pipe_pair *pipe_ptr = &config.pipes[ind];
+        fd_ptr->input_fd = open(pipe_ptr->input_pipe, O_RDONLY);
+        fd_ptr->output_fd = open(pipe_ptr->output_pipe, O_WRONLY);
+    }
+    /* initialize data for select() */
+    int maxfd;
+    fd_set readset;
+    fd_set working_readset;
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+
+    FD_ZERO(&readset);
+    FD_SET(STDIN_FILENO, &readset);
+    // TODO add input pipes to readset, setup maxfd
+    for(int i = 0; i < config.num_miners; i++){
+        FD_SET(client_fds[i].input_fd, &readset);
+        //maxfd = (maxfd < client_fds[i].input_fd ? client_fds[i].input_fd : maxfd);
+    }
+    FD_SET( STDIN_FILENO, &readset);
+    Tell_client_boss_start(client_fds, config.num_miners);
+    //fprintf(stderr,"Finish Tell_client_boss_started\n");
+    int flag = 1;
+    int n_treasure = 0;
+    int len;
+    MD5_CTX initial;
+    MD5_Init(&initial);
+    char buff[4096];
+    char cmd[10], path[PATH_MAX];
+    int mine_bin_fd = open(config.mine_file, O_RDONLY);
+    while( (len = read(mine_bin_fd, buff, sizeof(buff))) != 0 ){
+        //strcat(best_mine,buff);
+        memcpy(&working_readset, &readset, sizeof(readset));
+        if(select(FD_SETSIZE, &working_readset, NULL, NULL, &timeout) > 0){
+            memset(cmd, 0, sizeof(cmd));
+            memset(path, 0, sizeof(path));
+            scanf("%s", cmd);
+            //fprintf(stderr, "%s\n", cmd);
+            if(strcmp(cmd, "dump") == 0){
+                scanf("%s", path);
+            }
+            int rt = handle_command(cmd, &config, path, client_fds, mine_bin_fd, 1);
+            if(!rt){
+                for(int i = 0; i < config.num_miners; i++){
+                    close(client_fds[i].input_fd);
+                    close(client_fds[i].output_fd);
+                }
+                return 0;
+            }
+        }
+
+        best_mine_size += len;
+        MD5_Update(&initial, buff, len);
+    }
+    //fclose(fp);
+    close(mine_bin_fd);
+    //MD5_CTX tmpp = initial;
+    //n_treasure = Check_Prefix_Zeros(tmpp);
+    //if(n_treasure) best_treasure = n_treasure;
+    n_treasure++;
+    Protocol message[8];
+    while (1){
+        memcpy(&working_readset, &readset, sizeof(readset));
+        int ret = select(FD_SETSIZE, &working_readset, NULL, NULL, &timeout);
+        if(ret){
+            if (FD_ISSET(STDIN_FILENO, &working_readset)){
+                /* TODO handle user input here */
+                //fprintf(stderr, "There is a command\n");
+                
+                memset(cmd, 0, sizeof(cmd));
+                memset(path, 0, sizeof(path));
+                scanf("%s", cmd);
+                //fprintf(stderr, "%s\n", cmd);
+                if(strcmp(cmd, "dump") == 0){
+                    scanf("%s", path);
+                }
+                int rt = handle_command(cmd, &config, path, client_fds, mine_bin_fd, 0);
+                //fprintf(stderr, "rt = %d\n",rt);
+                if(!rt) break;
+            }
+            for(int i = 0; i < config.num_miners; i++){
+                if(FD_ISSET(client_fds[i].input_fd, &working_readset)){
+                    memset(&message[i], 0, sizeof(message[i]));
+                    read(client_fds[i].input_fd, &message[i], sizeof(message[i]));
+                    //fprintf(stderr, "finish read from %d\n", client_fds[i].input_fd);
+                }
+            }
+
+            for(int i = 0; i < config.num_miners; i++){
+                if(FD_ISSET(client_fds[i].input_fd, &working_readset)){
+                    if(message[i].op == FOUND_TREASURE  && (message[i].n_treasure == n_treasure) ){
+                        //fprintf(stderr, "%s FOUND_TREASURE\n", message[i].who_found_treasure);
+                        best_treasure = n_treasure;
+                        Protocol Found;
+                        memset(&Found, 0, sizeof(Protocol));
+                        Found.op = FOUND_TREASURE;
+                        Found.n_treasure = message[i].n_treasure;
+                        Found.strlength = message[i].strlength;
+                        Found.c = message[i].c;
+                        strcpy(best_md5, message[i].md5);
+                        strcpy(Found.who_found_treasure, message[i].who_found_treasure);
+                        for(int j = 0; j < Found.strlength; j++){
+                            Found.append_str[j] = message[i].append_str[j];
+                        }
+                        printf("A %d-treasure discovered! %s\n", message[i].n_treasure, message[i].md5);
+                        //fprintf(stderr,"append_str: %s\n", message[i].append_str);
+                        mine_bin_fd = open(config.mine_file, O_WRONLY | O_APPEND);
+                        if(write(mine_bin_fd, message[i].append_str, message[i].strlength)){
+                            best_mine_size += message[i].strlength;
+                        }
+                        close(mine_bin_fd);
+                        //fprintf(stderr, "best_mine_size = %d\n",best_mine_size);
+                        for(int j = 0; j < config.num_miners; j++)
+                            write(client_fds[j].output_fd, &Found, sizeof(Found));
+                        MD5_Init(&initial);
+                        initial = Found.c;
+                        n_treasure++;
+                        break;
+                    }
+                }
+            }
+        }
+        assign_jobs(client_fds, config.num_miners, n_treasure, &initial);    
+    }
+
+    /* TODO close file descriptors */
+    for(int i = 0; i < config.num_miners; i++){
+        close(client_fds[i].input_fd);
+        close(client_fds[i].output_fd);
+    }
+    return 0;
+}
